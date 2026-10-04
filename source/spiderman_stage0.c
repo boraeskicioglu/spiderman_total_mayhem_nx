@@ -1,0 +1,1462 @@
+/* spiderman_stage0.c -- first bring-up of Total Mayhem on android32.
+#include "dcr_boost.h"
+ *
+ * Stage 0 deliberately stops before graphics/audio/game-data init. It proves
+ * that the APK is recognised, libspiderman.so can be unpacked, relocated and
+ * resolved in a native AArch32 Switch process, and that its C++ constructors
+ * can run. Once this is clean on hardware, the renderer/JNI/input layer can be
+ * enabled without mixing loader failures with game-data failures.
+ */
+#include <sys/stat.h>
+#include <stdlib.h>
+#include <string.h>
+#include <EGL/egl.h>
+#include <GLES/gl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <switch.h>
+
+#include "config.h"
+#include "dcr_path.h"
+#include "dcr_setup.h"
+#include "error.h"
+#include "imports.h"
+#include "jni.h"
+#include "so_util.h"
+#include "util.h"
+
+int dcr_gl_selftest(void);
+
+#include "gl_layer.h"
+#include "rt_applet.h"
+#include "rt_window.h"
+#include "tm_audio.h"
+
+static so_module g_spiderman;
+
+/* android32 requires these port-owned JNI tables. Stage 0 does not enter the
+ * game's Java-facing renderer yet, so empty tables are intentional. */
+const JMethodDef jni_method_defs[] = {
+    {NULL, NULL, NULL, NULL},
+};
+const JFieldDef jni_field_defs[] = {
+    {NULL, NULL, NULL, 0, NULL},
+};
+const char *const jni_class_supers[][2] = {
+    {NULL, NULL},
+};
+const char *const jni_missing_classes[] = {
+    NULL,
+};
+
+static const char *const k_libs[] = {SM_LIB};
+const RtSetupPlan port_setup_plan = {
+    .libs = k_libs,
+    .nlibs = 1,
+    .libs_what = "Unpacking Total Mayhem's engine",
+    .apk_requirement = "This port needs Ultimate Spider-Man: Total Mayhem HD 1.0.8 for 32-bit ARM (armeabi).",
+    .libs_p0 = 200,
+    .libs_p1 = 900,
+    .classes_p0 = 900,
+    .classes_p1 = 950,
+};
+
+static void log_known_exports(void) {
+  static const char *const syms[] = {
+      "Java_com_gameloft_android_GAND_GloftSMHP_ML_GameRenderer_nativeRendererGetJNIEnv",
+      "Java_com_gameloft_android_GAND_GloftSMHP_ML_GameRenderer_nativeResize",
+      "Java_com_gameloft_android_GAND_GloftSMHP_ML_GameRenderer_nativeRendererInit",
+      "Java_com_gameloft_android_GAND_GloftSMHP_ML_GameRenderer_nativeUpdateAndRender",
+      "Java_com_gameloft_android_GAND_GloftSMHP_ML_GameGLSurfaceView_nativeOnTouch",
+      "Java_com_gameloft_android_GAND_GloftSMHP_ML_GLMediaPlayer_nativeInit",
+      "appKeyPressed",
+      "appKeyReleased",
+      NULL,
+  };
+  for (int i = 0; syms[i]; ++i)
+    debugPrintf("[stage0] export %-96s %p\n", syms[i],
+                (void *)so_try_find_addr_rx(&g_spiderman, syms[i]));
+}
+
+int port_load(const char *apk) {
+  dcr_setup_from_apk(apk);
+
+  char path[512];
+  snprintf(path, sizeof path, "%s/%s", dcr_game_root(), SM_LIB);
+  debugPrintf("[stage0] loading %s\n", path);
+
+  int rc = so_load(&g_spiderman, path, NULL, PORT_SO_REGION_BYTES);
+  if (rc < 0)
+    fatal_error("Stage 0: so_load failed for %s (rc=%d). See debug.log.", path, rc);
+
+  so_relocate(&g_spiderman);
+  int missing = so_resolve(&g_spiderman, dcr_imports, dcr_imports_count, 1);
+  int kuser = so_fix_kuser_helpers(&g_spiderman);
+  debugPrintf("[stage0] mapped size=%u KB unresolved=%d kuser_literals=%d\n",
+              (unsigned)(g_spiderman.load_size >> 10), missing, kuser);
+
+  if (missing)
+    fatal_error("Stage 0: %d imports are unresolved. Send debug.log before running constructors.", missing);
+
+  so_finalize(&g_spiderman);
+  so_flush_caches(&g_spiderman);
+  log_known_exports();
+  return 0;
+}
+
+/* ---- Stage 1B persistent GLES1 context ---- */
+static EGLDisplay g_tm_dpy = EGL_NO_DISPLAY;
+static EGLSurface g_tm_surface = EGL_NO_SURFACE;
+static EGLContext g_tm_context = EGL_NO_CONTEXT;
+
+EGLBoolean b_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface);
+
+static int tm_gfx_init(void) {
+  debugPrintf("[stage1b] creating persistent OpenGL ES 1 context...\n");
+  log_flush_ring();
+  if (log_console_active()) log_console_close();
+  dcr_window_prepare();
+
+  g_tm_dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+  EGLint major = 0, minor = 0;
+  if (g_tm_dpy == EGL_NO_DISPLAY || !eglInitialize(g_tm_dpy, &major, &minor)) {
+    debugPrintf("[stage1b] eglInitialize FAILED: 0x%x\n", eglGetError());
+    return -1;
+  }
+  if (!eglBindAPI(EGL_OPENGL_ES_API)) {
+    debugPrintf("[stage1b] eglBindAPI FAILED: 0x%x\n", eglGetError());
+    return -1;
+  }
+
+  EGLConfig cfg = 0;
+  EGLint count = 0;
+  static const EGLint attrs[] = {
+      EGL_RENDERABLE_TYPE, EGL_OPENGL_ES_BIT,
+      EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+      EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+      EGL_DEPTH_SIZE, 24,
+      EGL_NONE
+  };
+  if (!eglChooseConfig(g_tm_dpy, attrs, &cfg, 1, &count) || count < 1) {
+    static const EGLint fallback[] = {
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES_BIT,
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_NONE
+    };
+    debugPrintf("[stage1b] exact config unavailable; trying fallback\n");
+    if (!eglChooseConfig(g_tm_dpy, fallback, &cfg, 1, &count) || count < 1) {
+      debugPrintf("[stage1b] no GLES1 EGL config: 0x%x\n", eglGetError());
+      return -1;
+    }
+  }
+
+  static const EGLint ctx_attrs[] = { EGL_CONTEXT_CLIENT_VERSION, 1, EGL_NONE };
+  g_tm_surface = eglCreateWindowSurface(g_tm_dpy, cfg,
+      (EGLNativeWindowType)nwindowGetDefault(), NULL);
+  g_tm_context = eglCreateContext(g_tm_dpy, cfg, EGL_NO_CONTEXT, ctx_attrs);
+  if (g_tm_surface == EGL_NO_SURFACE || g_tm_context == EGL_NO_CONTEXT ||
+      !eglMakeCurrent(g_tm_dpy, g_tm_surface, g_tm_surface, g_tm_context)) {
+    debugPrintf("[stage1b] surface/context/make-current FAILED: 0x%x\n", eglGetError());
+    return -1;
+  }
+
+  eglSwapInterval(g_tm_dpy, 1);
+  int w = 0, h = 0;
+  dcr_window_size(&w, &h);
+  glViewport(0, 0, w, h);
+  debugPrintf("[stage1b] EGL %d.%d; GLES1 context %dx%d\n", major, minor, w, h);
+  debugPrintf("[stage1b] GL_VENDOR   = %s\n", (const char *)glGetString(GL_VENDOR));
+  debugPrintf("[stage1b] GL_RENDERER = %s\n", (const char *)glGetString(GL_RENDERER));
+  debugPrintf("[stage1b] GL_VERSION  = %s\n", (const char *)glGetString(GL_VERSION));
+  log_flush_ring();
+  return 0;
+}
+
+static void tm_gfx_shutdown(void) {
+  if (g_tm_dpy == EGL_NO_DISPLAY) return;
+  eglMakeCurrent(g_tm_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+  if (g_tm_context != EGL_NO_CONTEXT) eglDestroyContext(g_tm_dpy, g_tm_context);
+  if (g_tm_surface != EGL_NO_SURFACE) eglDestroySurface(g_tm_dpy, g_tm_surface);
+  eglTerminate(g_tm_dpy);
+  g_tm_context = EGL_NO_CONTEXT;
+  g_tm_surface = EGL_NO_SURFACE;
+  g_tm_dpy = EGL_NO_DISPLAY;
+}
+
+/* ---- Stage 1C GL diagnostics + input bridge ---- */
+
+#define TM_GL_DEBUG_OUTPUT      0x92E0
+#define TM_GL_DEBUG_TYPE_ERROR  0x824C
+#define TM_GL_DONT_CARE         0x1100
+
+typedef void (*tm_gl_debug_proc)(
+    GLenum source, GLenum type, GLuint id, GLenum severity,
+    GLsizei length, const char *message, const void *user);
+
+static void tm_gl_debug_cb(
+    GLenum source, GLenum type, GLuint id, GLenum severity,
+    GLsizei length, const char *message, const void *user) {
+  (void)source;
+  (void)id;
+  (void)severity;
+  (void)length;
+  (void)user;
+
+  if (type == TM_GL_DEBUG_TYPE_ERROR) {
+    debugPrintf("[stage1c-gl] %s\n", message ? message : "(no message)");
+    log_flush_ring();
+  }
+}
+
+static void tm_enable_gl_debug(void) {
+  const char *ext = (const char *)glGetString(GL_EXTENSIONS);
+
+  void (*callback)(tm_gl_debug_proc, const void *) =
+      (void (*)(tm_gl_debug_proc, const void *))
+          eglGetProcAddress("glDebugMessageCallbackKHR");
+
+  void (*control)(GLenum, GLenum, GLenum, GLsizei, const GLuint *, GLboolean) =
+      (void (*)(GLenum, GLenum, GLenum, GLsizei, const GLuint *, GLboolean))
+          eglGetProcAddress("glDebugMessageControlKHR");
+
+  if (!ext || !strstr(ext, "GL_KHR_debug") || !callback || !control) {
+    debugPrintf("[stage1c-gl] KHR_debug unavailable; RT_GL_CHECK stays enabled\n");
+    log_flush_ring();
+    return;
+  }
+
+  control(TM_GL_DONT_CARE, TM_GL_DONT_CARE, TM_GL_DONT_CARE,
+          0, NULL, GL_FALSE);
+  control(TM_GL_DONT_CARE, TM_GL_DEBUG_TYPE_ERROR, TM_GL_DONT_CARE,
+          0, NULL, GL_TRUE);
+
+  callback(tm_gl_debug_cb, NULL);
+  glEnable(TM_GL_DEBUG_OUTPUT);
+
+  debugPrintf("[stage1c-gl] GL error tracing enabled before renderer init\n");
+  log_flush_ring();
+}
+
+typedef int (*tm_fn_touch)(
+    void *env, void *obj,
+    int action, int x, int y, int index);
+
+static int tm_scale_x(int x960, int game_w) {
+  return (x960 * game_w) / 960;
+}
+
+static int tm_scale_y(int y544, int game_h) {
+  return (y544 * game_h) / 544;
+}
+
+static void tm_virtual_touch(
+    tm_fn_touch touch,
+    int action,
+    int x960,
+    int y544,
+    int index,
+    int game_w,
+    int game_h) {
+  touch(g_jni_env, NULL, action,
+        tm_scale_x(x960, game_w),
+        tm_scale_y(y544, game_h),
+        index);
+}
+
+/* ---- Stage 1D S3TC fallback ---------------------------------------------
+ *
+ * Total Mayhem uploads many UI/font atlases as S3TC/DXT textures. The current
+ * Mesa32 GLES1 context rejects GL_COMPRESSED_RGBA_S3TC_DXT5_EXT (0x83F3)
+ * with GL_INVALID_ENUM, leaving those textures incomplete/white.
+ *
+ * Decode BC1/DXT1, BC2/DXT3 and BC3/DXT5 on the CPU at upload time and feed
+ * Mesa ordinary RGBA8. This is a correctness fallback; it costs CPU only when
+ * textures are uploaded, not every frame.
+ */
+
+#define TM_DXT1_RGB   0x83F0
+#define TM_DXT1_RGBA  0x83F1
+#define TM_DXT3_RGBA  0x83F2
+#define TM_DXT5_RGBA  0x83F3
+
+typedef void (*tm_gl_comp_fn)(
+    GLenum target, GLint level, GLenum internalformat,
+    GLsizei width, GLsizei height, GLint border,
+    GLsizei imageSize, const void *data);
+
+static tm_gl_comp_fn tm_real_glCompressedTexImage2D;
+
+static uint16_t tm_le16(const uint8_t *p) {
+  return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint32_t tm_le32(const uint8_t *p) {
+  return (uint32_t)p[0] |
+         ((uint32_t)p[1] << 8) |
+         ((uint32_t)p[2] << 16) |
+         ((uint32_t)p[3] << 24);
+}
+
+static void tm_565(uint16_t c, uint8_t out[4]) {
+  uint8_t r5 = (uint8_t)((c >> 11) & 31);
+  uint8_t g6 = (uint8_t)((c >> 5) & 63);
+  uint8_t b5 = (uint8_t)(c & 31);
+
+  out[0] = (uint8_t)((r5 << 3) | (r5 >> 2));
+  out[1] = (uint8_t)((g6 << 2) | (g6 >> 4));
+  out[2] = (uint8_t)((b5 << 3) | (b5 >> 2));
+  out[3] = 255;
+}
+
+static void tm_mix3(uint8_t out[4], const uint8_t a[4], const uint8_t b[4],
+                    int wa, int wb, int div) {
+  out[0] = (uint8_t)((wa * a[0] + wb * b[0]) / div);
+  out[1] = (uint8_t)((wa * a[1] + wb * b[1]) / div);
+  out[2] = (uint8_t)((wa * a[2] + wb * b[2]) / div);
+  out[3] = 255;
+}
+
+static void tm_decode_color_table(
+    const uint8_t *cblk, int dxt1_alpha_mode, uint8_t c[4][4]) {
+  uint16_t c0 = tm_le16(cblk + 0);
+  uint16_t c1 = tm_le16(cblk + 2);
+
+  tm_565(c0, c[0]);
+  tm_565(c1, c[1]);
+
+  if (!dxt1_alpha_mode || c0 > c1) {
+    tm_mix3(c[2], c[0], c[1], 2, 1, 3);
+    tm_mix3(c[3], c[0], c[1], 1, 2, 3);
+  } else {
+    c[2][0] = (uint8_t)(((int)c[0][0] + c[1][0]) / 2);
+    c[2][1] = (uint8_t)(((int)c[0][1] + c[1][1]) / 2);
+    c[2][2] = (uint8_t)(((int)c[0][2] + c[1][2]) / 2);
+    c[2][3] = 255;
+
+    c[3][0] = 0;
+    c[3][1] = 0;
+    c[3][2] = 0;
+    c[3][3] = 0;
+  }
+}
+
+static void tm_decode_dxt5_alpha(const uint8_t *blk, uint8_t a[8]) {
+  a[0] = blk[0];
+  a[1] = blk[1];
+
+  if (a[0] > a[1]) {
+    a[2] = (uint8_t)((6 * a[0] + 1 * a[1]) / 7);
+    a[3] = (uint8_t)((5 * a[0] + 2 * a[1]) / 7);
+    a[4] = (uint8_t)((4 * a[0] + 3 * a[1]) / 7);
+    a[5] = (uint8_t)((3 * a[0] + 4 * a[1]) / 7);
+    a[6] = (uint8_t)((2 * a[0] + 5 * a[1]) / 7);
+    a[7] = (uint8_t)((1 * a[0] + 6 * a[1]) / 7);
+  } else {
+    a[2] = (uint8_t)((4 * a[0] + 1 * a[1]) / 5);
+    a[3] = (uint8_t)((3 * a[0] + 2 * a[1]) / 5);
+    a[4] = (uint8_t)((2 * a[0] + 3 * a[1]) / 5);
+    a[5] = (uint8_t)((1 * a[0] + 4 * a[1]) / 5);
+    a[6] = 0;
+    a[7] = 255;
+  }
+}
+
+static int tm_is_s3tc(GLenum fmt) {
+  return fmt == TM_DXT1_RGB ||
+         fmt == TM_DXT1_RGBA ||
+         fmt == TM_DXT3_RGBA ||
+         fmt == TM_DXT5_RGBA;
+}
+
+static int tm_decode_s3tc(
+    GLenum fmt,
+    int w,
+    int h,
+    const uint8_t *src,
+    size_t src_size,
+    uint8_t *dst) {
+
+  const int is_dxt1 = (fmt == TM_DXT1_RGB || fmt == TM_DXT1_RGBA);
+  const int block_bytes = is_dxt1 ? 8 : 16;
+  const int bw = (w + 3) / 4;
+  const int bh = (h + 3) / 4;
+  const size_t need = (size_t)bw * (size_t)bh * (size_t)block_bytes;
+
+  if (!src || src_size < need)
+    return 0;
+
+  for (int by = 0; by < bh; by++) {
+    for (int bx = 0; bx < bw; bx++) {
+      const uint8_t *blk =
+          src + ((size_t)by * bw + bx) * (size_t)block_bytes;
+
+      const uint8_t *cblk = is_dxt1 ? blk : blk + 8;
+
+      uint8_t colors[4][4];
+      tm_decode_color_table(
+          cblk,
+          fmt == TM_DXT1_RGBA,
+          colors);
+
+      uint32_t ci = tm_le32(cblk + 4);
+
+      uint64_t alpha_bits = 0;
+      uint8_t alpha_table[8] = {255,255,255,255,255,255,255,255};
+
+      if (fmt == TM_DXT5_RGBA) {
+        tm_decode_dxt5_alpha(blk, alpha_table);
+
+        for (int i = 0; i < 6; i++)
+          alpha_bits |= ((uint64_t)blk[2 + i]) << (8 * i);
+      }
+
+      uint64_t dxt3_alpha = 0;
+      if (fmt == TM_DXT3_RGBA) {
+        for (int i = 0; i < 8; i++)
+          dxt3_alpha |= ((uint64_t)blk[i]) << (8 * i);
+      }
+
+      for (int py = 0; py < 4; py++) {
+        for (int px = 0; px < 4; px++) {
+          const int x = bx * 4 + px;
+          const int y = by * 4 + py;
+          const int p = py * 4 + px;
+
+          if (x >= w || y >= h)
+            continue;
+
+          const unsigned idx = (ci >> (2 * p)) & 3u;
+          uint8_t *o = dst + ((size_t)y * w + x) * 4u;
+
+          o[0] = colors[idx][0];
+          o[1] = colors[idx][1];
+          o[2] = colors[idx][2];
+          o[3] = colors[idx][3];
+
+          if (fmt == TM_DXT3_RGBA) {
+            unsigned nibble = (unsigned)((dxt3_alpha >> (4 * p)) & 0xFu);
+            o[3] = (uint8_t)(nibble * 17u);
+          } else if (fmt == TM_DXT5_RGBA) {
+            unsigned ai = (unsigned)((alpha_bits >> (3 * p)) & 7u);
+            o[3] = alpha_table[ai];
+          }
+        }
+      }
+    }
+  }
+
+  return 1;
+}
+
+static void tm_glCompressedTexImage2D(
+    GLenum target, GLint level, GLenum internalformat,
+    GLsizei width, GLsizei height, GLint border,
+    GLsizei imageSize, const void *data) {
+
+  if (!tm_is_s3tc(internalformat) ||
+      width <= 0 || height <= 0 || !data) {
+    if (tm_real_glCompressedTexImage2D) {
+      tm_real_glCompressedTexImage2D(
+          target, level, internalformat,
+          width, height, border, imageSize, data);
+    }
+    return;
+  }
+
+  size_t rgba_size = (size_t)width * (size_t)height * 4u;
+  uint8_t *rgba = (uint8_t *)malloc(rgba_size);
+
+  if (!rgba) {
+    debugPrintf("[stage1d] S3TC fallback OOM for %dx%d fmt 0x%x\n",
+                (int)width, (int)height, (unsigned)internalformat);
+    log_flush_ring();
+
+    if (tm_real_glCompressedTexImage2D) {
+      tm_real_glCompressedTexImage2D(
+          target, level, internalformat,
+          width, height, border, imageSize, data);
+    }
+    return;
+  }
+
+  if (!tm_decode_s3tc(
+          internalformat,
+          (int)width,
+          (int)height,
+          (const uint8_t *)data,
+          (size_t)imageSize,
+          rgba)) {
+    free(rgba);
+
+    debugPrintf("[stage1d] malformed S3TC upload %dx%d fmt 0x%x size 0x%x\n",
+                (int)width, (int)height,
+                (unsigned)internalformat,
+                (unsigned)imageSize);
+    log_flush_ring();
+
+    if (tm_real_glCompressedTexImage2D) {
+      tm_real_glCompressedTexImage2D(
+          target, level, internalformat,
+          width, height, border, imageSize, data);
+    }
+    return;
+  }
+
+  static unsigned converted;
+  converted++;
+
+  if (converted <= 32) {
+    debugPrintf(
+        "[stage1d] S3TC 0x%x %dx%d level %d -> RGBA8 (%u)\n",
+        (unsigned)internalformat,
+        (int)width, (int)height, (int)level,
+        converted);
+    log_flush_ring();
+  }
+
+  /*
+   * GLES1 accepts GL_RGBA/GL_UNSIGNED_BYTE here. The texture object and all
+   * filtering/wrap state are preserved; only storage/upload representation
+   * changes from BCn/S3TC to ordinary RGBA8.
+   */
+  glTexImage2D(
+      target, level,
+      GL_RGBA,
+      width, height, border,
+      GL_RGBA, GL_UNSIGNED_BYTE,
+      rgba);
+
+  free(rgba);
+}
+
+uintptr_t port_gl_wrap(const char *name, uintptr_t real) {
+  if (name && strcmp(name, "glCompressedTexImage2D") == 0) {
+    tm_real_glCompressedTexImage2D = (tm_gl_comp_fn)real;
+    debugPrintf("[stage1d] hooked glCompressedTexImage2D for S3TC fallback\n");
+    return (uintptr_t)tm_glCompressedTexImage2D;
+  }
+
+  return 0;
+}
+
+/* ---- end Stage 1D S3TC fallback ---- */
+
+/* ---- Stage 1E Switch controls + save verification ---------------------- */
+
+typedef struct {
+  const char *name;
+  long long size;
+  long long mtime;
+  int valid;
+} TMSaveWatch;
+
+static TMSaveWatch tm_save_watch[] = {
+    {"save.dat",        -1, -1, 0},
+    {"checkpoint.dat",  -1, -1, 0},
+    {"levelRanks.dat",  -1, -1, 0},
+    {"settings.dat",    -1, -1, 0},
+    {"androidTrophy.dat",-1, -1, 0},
+};
+
+static void tm_save_watch_tick(int force_log) {
+  for (unsigned i = 0;
+       i < sizeof(tm_save_watch) / sizeof(tm_save_watch[0]);
+       ++i) {
+
+    char android_path[256];
+    char real_path[DCR_PATH_MAX];
+
+    snprintf(android_path, sizeof android_path,
+             "/sdcard/gameloft/games/GloftSMHP/%s",
+             tm_save_watch[i].name);
+
+    const char *real =
+        dcr_translate_path(android_path, real_path, sizeof real_path);
+
+    struct stat st;
+    const int ok = stat(real, &st) == 0;
+
+    if (!ok) {
+      if (force_log || tm_save_watch[i].valid) {
+        debugPrintf("[stage1e-save] %s: MISSING (%s)\n",
+                    tm_save_watch[i].name, real);
+        log_flush_ring();
+      }
+
+      tm_save_watch[i].valid = 0;
+      tm_save_watch[i].size = -1;
+      tm_save_watch[i].mtime = -1;
+      continue;
+    }
+
+    const long long sz = (long long)st.st_size;
+    const long long mt = (long long)st.st_mtime;
+
+    if (force_log || !tm_save_watch[i].valid) {
+      debugPrintf("[stage1e-save] %s: size=%lld mtime=%lld\n",
+                  tm_save_watch[i].name, sz, mt);
+      log_flush_ring();
+    } else if (tm_save_watch[i].size != sz ||
+               tm_save_watch[i].mtime != mt) {
+      debugPrintf(
+          "[stage1e-save] CHANGED %s: size %lld -> %lld, mtime %lld -> %lld\n",
+          tm_save_watch[i].name,
+          tm_save_watch[i].size, sz,
+          tm_save_watch[i].mtime, mt);
+      log_flush_ring();
+    }
+
+    tm_save_watch[i].valid = 1;
+    tm_save_watch[i].size = sz;
+    tm_save_watch[i].mtime = mt;
+  }
+}
+
+/* ---- Stage 1F controller polish --------------------------------------- */
+
+/* Hide only the permanent Android gameplay controls. Contextual interaction,
+ * NPC and QTE prompts are intentionally NOT patched, so they stay visible in
+ * controller mode.
+ */
+typedef struct {
+  const char *symbol;
+  uintptr_t addr;
+  uint16_t first;
+  int ready;
+} TMDrawPatch;
+
+static TMDrawPatch tm_touch_draws[] = {
+    {"_ZN14AnalogJoystick4DrawEi", 0, 0, 0},
+    {"_ZN11CButtonJump4DrawEi",    0, 0, 0},
+    {"_ZN12CButtonPunch4DrawEi",   0, 0, 0},
+    {"_ZN10CButtonWeb4DrawEi",     0, 0, 0},
+    {"_ZN12CButtonSuper4DrawEi",   0, 0, 0},
+    {"_ZN11CButtonKick4DrawEi",    0, 0, 0},
+    {"_ZN11CButtonBomb4DrawEi",    0, 0, 0},
+    {"_ZN12CButtonSense4DrawEi",   0, 0, 0},
+};
+
+static int tm_touch_ui_visible = 1;
+
+static void tm_touch_ui_init(void) {
+  unsigned found = 0;
+
+  for (unsigned i = 0;
+       i < sizeof(tm_touch_draws) / sizeof(tm_touch_draws[0]);
+       ++i) {
+    uintptr_t fn =
+        so_try_find_addr_rx(&g_spiderman, tm_touch_draws[i].symbol);
+
+    if (!fn)
+      continue;
+
+    tm_touch_draws[i].addr = fn & ~(uintptr_t)1u;
+    tm_touch_draws[i].first =
+        *(volatile const uint16_t *)tm_touch_draws[i].addr;
+    tm_touch_draws[i].ready = 1;
+    found++;
+  }
+
+  debugPrintf(
+      "[stage1f-ui] %u permanent mobile-control draw funcs found; "
+      "context/NPC/QTE prompts stay visible\n", found);
+  log_flush_ring();
+}
+
+static void tm_touch_ui_set_visible(int visible) {
+  if (visible == tm_touch_ui_visible)
+    return;
+
+  for (unsigned i = 0;
+       i < sizeof(tm_touch_draws) / sizeof(tm_touch_draws[0]);
+       ++i) {
+    if (!tm_touch_draws[i].ready)
+      continue;
+
+    uint16_t insn =
+        visible ? tm_touch_draws[i].first : (uint16_t)0x4770; /* bx lr */
+
+    if (so_patch_code((void *)tm_touch_draws[i].addr,
+                      &insn, sizeof insn) != 0) {
+      debugPrintf("[stage1f-ui] patch failed for %s\n",
+                  tm_touch_draws[i].symbol);
+    }
+  }
+
+  tm_touch_ui_visible = visible;
+
+  debugPrintf("[stage1f-ui] mobile joystick/buttons %s\n",
+              visible ? "VISIBLE (real touchscreen)" :
+                        "HIDDEN (controller mode)");
+  log_flush_ring();
+}
+
+/* Keep every old Android resolution helper consistent with the real Switch
+ * framebuffer. nativeResize() already receives this size, but this game also
+ * consults GetWidthOfScreen/GetHeightOfScreen/UIInfo separately.
+ */
+static int tm_screen_w = 1280;
+static int tm_screen_h = 720;
+
+static int tm_get_screen_w(int ignored) {
+  (void)ignored;
+  return tm_screen_w;
+}
+
+static int tm_get_screen_h(int ignored) {
+  (void)ignored;
+  return tm_screen_h;
+}
+
+static int tm_ui_get_screen_w(void *self) {
+  (void)self;
+  return tm_screen_w;
+}
+
+static int tm_ui_get_screen_h(void *self) {
+  (void)self;
+  return tm_screen_h;
+}
+
+static float tm_ui_enlarge_x(void *self, int ignored) {
+  (void)self;
+  (void)ignored;
+  return (float)tm_screen_w / 480.0f;
+}
+
+static float tm_ui_enlarge_y(void *self, int ignored) {
+  (void)self;
+  (void)ignored;
+  return (float)tm_screen_h / 320.0f;
+}
+
+/* The Java sound backend is not implemented yet. The game's native volume
+ * helpers currently call a NULL Java method ID, which makes the settings UI
+ * snap back. Keep group volume natively so the sliders/settings can work.
+ * Actual OGG playback is a separate audio-backend step.
+ */
+static float tm_group_volume[2] = {1.0f, 1.0f};
+
+static int tm_group_index(int group_id) {
+  int idx = group_id - 1;
+  if (idx < 0) idx = 0;
+  if (idx > 1) idx = 1;
+  return idx;
+}
+
+static float tm_native_get_group_volume(int group_id) {
+  return tm_group_volume[tm_group_index(group_id)];
+}
+
+static void tm_native_set_group_volume(int group_id, float volume) {
+  if (volume < 0.0f) volume = 0.0f;
+  if (volume > 1.0f) volume = 1.0f;
+
+  tm_group_volume[tm_group_index(group_id)] = volume;
+
+  debugPrintf("[stage1f-audio] group %d volume = %.3f\n",
+              group_id, volume);
+  log_flush_ring();
+}
+
+static void tm_native_set_sound_volume(int id, float volume) {
+  (void)id;
+  (void)volume;
+}
+
+/* State-aware menu controller. The generic Android build's appKeyPressed is
+ * a no-op, so menus remain touch-native. We expose them as a normal Switch
+ * cursor: stick/D-pad moves it, A taps, B sends Android BACK.
+ */
+typedef void *(*tm_fn_current_state)(void *state_stack);
+typedef void (*tm_fn_native_key)(void *env, void *obj, int keycode);
+
+static tm_fn_current_state tm_current_state;
+static void **tm_application_instance_slot;
+static tm_fn_native_key tm_native_key_up;
+
+/*
+ * gxStateStack::CurrentState() is a C++ member function.
+ *
+ * In this exact 1.0.8 binary, the game's own callers load
+ * Singleton<Application>::s_instance and pass (Application + 4) as r0/the
+ * gxStateStack 'this' pointer. Calling it as a no-argument function leaves
+ * tm_state_is(id)'s id in r0; with id=2 the first ldr [r0,#0x38] faults at
+ * address 0x3a.
+ */
+static void *tm_get_current_state(void) {
+  if (!tm_current_state || !tm_application_instance_slot)
+    return NULL;
+
+  void *app = *tm_application_instance_slot;
+  if (!app)
+    return NULL;
+
+  return tm_current_state((void *)((uint8_t *)app + 4));
+}
+
+static int tm_state_is(int id) {
+  void *state = tm_get_current_state();
+  if (!state)
+    return 0;
+
+  void **vt = *(void ***)state;
+  if (!vt || !vt[2])
+    return 0;
+
+  typedef int (*tm_fn_is_kind)(void *self, int id);
+  return ((tm_fn_is_kind)vt[2])(state, id) != 0;
+}
+
+/* Exact 1.0.8 state IDs used by this controller layer. */
+static int tm_is_gameplay_state(void) {
+  return tm_state_is(2);
+}
+
+static int tm_is_menu_state(void) {
+  if (tm_is_gameplay_state())
+    return 0;
+  if (tm_state_is(8))   /* GS_Loading */
+    return 0;
+  if (tm_state_is(55))  /* GS_Resume */
+    return 0;
+  return tm_get_current_state() != NULL;
+}
+
+static void tm_menu_tap(tm_fn_touch touch, int x, int y, int index) {
+  touch(g_jni_env, NULL, 1, x, y, index);
+  touch(g_jni_env, NULL, 0, x, y, index);
+}
+
+static void tm_draw_menu_cursor(int x, int y, int w, int h) {
+  /*
+   * Mesa20/android32 exposes the game's GLES1 fixed-function entry points
+   * through dcr_gl_lookup()/eglGetProcAddress. They are intentionally not
+   * linked as ordinary host symbols, so resolve the GLES1-only calls here.
+   */
+  typedef void (*fn_matrix_mode)(GLenum);
+  typedef void (*fn_void)(void);
+  typedef void (*fn_orthof)(GLfloat, GLfloat, GLfloat, GLfloat, GLfloat, GLfloat);
+  typedef void (*fn_color4f)(GLfloat, GLfloat, GLfloat, GLfloat);
+  typedef void (*fn_enable_client_state)(GLenum);
+  typedef void (*fn_vertex_pointer)(GLint, GLenum, GLsizei, const void *);
+
+  static int looked;
+  static fn_matrix_mode pMatrixMode;
+  static fn_void pPushMatrix;
+  static fn_void pLoadIdentity;
+  static fn_orthof pOrthof;
+  static fn_color4f pColor4f;
+  static fn_enable_client_state pEnableClientState;
+  static fn_vertex_pointer pVertexPointer;
+  static fn_void pPopMatrix;
+
+  if (!looked) {
+    looked = 1;
+    pMatrixMode = (fn_matrix_mode)dcr_gl_lookup("glMatrixMode");
+    pPushMatrix = (fn_void)dcr_gl_lookup("glPushMatrix");
+    pLoadIdentity = (fn_void)dcr_gl_lookup("glLoadIdentity");
+    pOrthof = (fn_orthof)dcr_gl_lookup("glOrthof");
+    pColor4f = (fn_color4f)dcr_gl_lookup("glColor4f");
+    pEnableClientState =
+        (fn_enable_client_state)dcr_gl_lookup("glEnableClientState");
+    pVertexPointer =
+        (fn_vertex_pointer)dcr_gl_lookup("glVertexPointer");
+    pPopMatrix = (fn_void)dcr_gl_lookup("glPopMatrix");
+
+    debugPrintf(
+        "[stage1f-menu] GLES1 cursor funcs: matrix=%p ortho=%p color=%p "
+        "client=%p vertex=%p\n",
+        pMatrixMode, pOrthof, pColor4f,
+        pEnableClientState, pVertexPointer);
+    log_flush_ring();
+  }
+
+  if (!pMatrixMode || !pPushMatrix || !pLoadIdentity ||
+      !pOrthof || !pColor4f || !pEnableClientState ||
+      !pVertexPointer || !pPopMatrix) {
+    return;
+  }
+
+  GLfloat v[] = {
+      (GLfloat)(x - 14), (GLfloat)y,
+      (GLfloat)(x + 14), (GLfloat)y,
+      (GLfloat)x, (GLfloat)(y - 14),
+      (GLfloat)x, (GLfloat)(y + 14),
+  };
+
+  GLboolean tex = glIsEnabled(GL_TEXTURE_2D);
+  GLboolean depth = glIsEnabled(GL_DEPTH_TEST);
+  GLboolean blend = glIsEnabled(GL_BLEND);
+
+  GLint old_matrix_mode = GL_MODELVIEW;
+  GLfloat old_line_width = 1.0f;
+  GLfloat old_color[4] = {1, 1, 1, 1};
+
+  glGetIntegerv(GL_MATRIX_MODE, &old_matrix_mode);
+  glGetFloatv(GL_LINE_WIDTH, &old_line_width);
+  glGetFloatv(GL_CURRENT_COLOR, old_color);
+
+  pMatrixMode(GL_PROJECTION);
+  pPushMatrix();
+  pLoadIdentity();
+  pOrthof(0.0f, (GLfloat)w, (GLfloat)h, 0.0f, -1.0f, 1.0f);
+
+  pMatrixMode(GL_MODELVIEW);
+  pPushMatrix();
+  pLoadIdentity();
+
+  glDisable(GL_TEXTURE_2D);
+  glDisable(GL_DEPTH_TEST);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+  pColor4f(1.0f, 1.0f, 1.0f, 0.95f);
+  glLineWidth(3.0f);
+
+  pEnableClientState(GL_VERTEX_ARRAY);
+  pVertexPointer(2, GL_FLOAT, 0, v);
+  glDrawArrays(GL_LINES, 0, 4);
+
+  glLineWidth(old_line_width);
+  pColor4f(old_color[0], old_color[1], old_color[2], old_color[3]);
+
+  if (tex) glEnable(GL_TEXTURE_2D); else glDisable(GL_TEXTURE_2D);
+  if (depth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+  if (blend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+
+  pPopMatrix();
+  pMatrixMode(GL_PROJECTION);
+  pPopMatrix();
+  pMatrixMode((GLenum)old_matrix_mode);
+}
+
+/* Stage 1F hook fix: game exports may be ARM or Thumb.
+ *
+ * hook_arm() only patches an ARM instruction stream. Total Mayhem has Thumb
+ * exports too (for example UIInfo::GetScrW / GetScrH), so preserve bit0 and
+ * write a Thumb-2 absolute branch stub for those entries.
+ */
+static int tm_hook_addr_interworking(uintptr_t addr, uintptr_t dst) {
+  if (!addr)
+    return -1;
+
+  if (addr & 1u) {
+    uintptr_t p = addr & ~(uintptr_t)1u;
+
+    /* Thumb entry at address +2: align the 8-byte LDR.W/literal pair by
+     * leaving one 16-bit NOP first, exactly like the working Vita hooker.
+     */
+    if (p & 2u) {
+      const uint16_t nop = 0xbf00u;
+      if (so_patch_code((void *)p, &nop, sizeof nop) != 0)
+        return -1;
+      p += 2;
+    }
+
+    const uint32_t stub[2] = {
+        0xf000f8dfu,       /* Thumb-2: LDR.W PC, [PC] */
+        (uint32_t)dst
+    };
+
+    return so_patch_code((void *)p, stub, sizeof stub);
+  }
+
+  hook_arm(addr, dst);
+  return 0;
+}
+
+static void tm_install_game_hooks(int w, int h) {
+  tm_screen_w = w;
+  tm_screen_h = h;
+
+#define TM_HOOK(sym, fn)                                                    \
+  do {                                                                      \
+    uintptr_t a = so_try_find_addr_rx(&g_spiderman, (sym));                \
+    if (a)                                                                  \
+      tm_hook_addr_interworking(a, (uintptr_t)(fn));                        \
+  } while (0)
+
+  TM_HOOK("_Z16GetWidthOfScreeni", tm_get_screen_w);
+  TM_HOOK("_Z17GetHeightOfScreeni", tm_get_screen_h);
+  TM_HOOK("_ZN6UIInfo7GetScrWEv", tm_ui_get_screen_w);
+  TM_HOOK("_ZN6UIInfo7GetScrHEv", tm_ui_get_screen_h);
+  TM_HOOK("_ZN6UIInfo12EnlargeRateXEi", tm_ui_enlarge_x);
+  TM_HOOK("_ZN6UIInfo12EnlargeRateYEi", tm_ui_enlarge_y);
+
+  TM_HOOK("nativeGetGroupVolume", tm_native_get_group_volume);
+  TM_HOOK("nativeSetGroupVolume", tm_native_set_group_volume);
+  TM_HOOK("nativeSetSoundVolume", tm_native_set_sound_volume);
+
+
+  /* Stage 1H: replace Android Java SoundPool/MediaPlayer with native OGG
+   * playback through Switch audout.
+   */
+  tm_audio_init();
+
+  TM_HOOK("nativePlaySound",           tm_audio_play_sound);
+  TM_HOOK("nativeCreateEmitter",       tm_audio_create_emitter);
+  TM_HOOK("nativePlayEmitter",         tm_audio_play_emitter);
+
+  TM_HOOK("nativeStopSound",           tm_audio_stop_sound);
+  TM_HOOK("nativeKillSound",           tm_audio_kill_sound);
+  TM_HOOK("nativePauseSound",          tm_audio_pause_sound);
+  TM_HOOK("nativeResumeSound",         tm_audio_resume_sound);
+
+  TM_HOOK("nativeStopEmitter",         tm_audio_stop_emitter);
+  TM_HOOK("nativeKillEmitter",         tm_audio_kill_emitter);
+  TM_HOOK("nativePauseEmitter",        tm_audio_pause_emitter);
+  TM_HOOK("nativeResumeEmitter",       tm_audio_resume_emitter);
+
+  TM_HOOK("nativeStopAllSounds",       tm_audio_stop_all);
+  TM_HOOK("nativeKillAll",             tm_audio_kill_all);
+  TM_HOOK("nativeKillAllSounds",       tm_audio_kill_all);
+  TM_HOOK("nativePauseAllSounds",      tm_audio_pause_all);
+  TM_HOOK("nativeResumeAllSounds",     tm_audio_resume_all);
+
+  TM_HOOK("nativeStopGroup",           tm_audio_stop_group);
+  TM_HOOK("nativePauseGroup",          tm_audio_pause_group);
+  TM_HOOK("nativeResumeGroup",         tm_audio_resume_group);
+
+  TM_HOOK("nativeIsMediaPlaying",      tm_audio_is_media_playing);
+  TM_HOOK("nativeIsEmitterPlaying",    tm_audio_is_emitter_playing);
+  TM_HOOK("nativeIsEmitterStopped",    tm_audio_is_emitter_stopped);
+  TM_HOOK("nativeIsEmitterAlive",      tm_audio_is_emitter_alive);
+
+  TM_HOOK("nativeSetSoundVolume",      tm_audio_set_sound_volume);
+  TM_HOOK("nativeSetEmitterVolume",    tm_audio_set_emitter_volume);
+  TM_HOOK("nativeGetEmitterVolume",    tm_audio_get_emitter_volume);
+
+  /* 3D audio updates are extremely frequent. The Android build sends these
+   * through JNI every frame; centered stereo is enough for this port, so eat
+   * the calls natively instead of generating thousands of bad-method logs.
+   */
+  TM_HOOK("nativeSetEmitterPos",       tm_audio_set_emitter_pos);
+  TM_HOOK("nativeSetListenerPos",      tm_audio_set_listener_pos);
+  TM_HOOK("nativeGetEmitterPos",       tm_audio_get_emitter_pos);
+  TM_HOOK("nativeGetListenerPos",      tm_audio_get_listener_pos);
+  TM_HOOK("nativeGetFarthestDistance", tm_audio_get_farthest_distance);
+  TM_HOOK("nativePaused",              tm_audio_paused);
+
+  TM_HOOK("nativeGetGroupVolume",      tm_audio_get_group_volume);
+  TM_HOOK("nativeSetGroupVolume",      tm_audio_set_group_volume);
+
+  TM_HOOK("nativeFindFarthestEmitter", tm_audio_find_farthest_emitter);
+  TM_HOOK("nativeInitSoundPool",       tm_audio_init_sound_pool);
+  TM_HOOK("nativeDestroySoundPool",    tm_audio_destroy_sound_pool);
+
+  debugPrintf("[stage1h-audio] Android audio JNI bridge replaced with native OGG mixer\n");
+  log_flush_ring();
+
+#undef TM_HOOK
+
+  tm_current_state = (tm_fn_current_state)so_try_find_addr_rx(
+      &g_spiderman, "_ZN12gxStateStack12CurrentStateEv");
+
+  tm_application_instance_slot = (void **)so_try_find_addr_rx(
+      &g_spiderman, "_ZN9SingletonI11ApplicationE10s_instanceE");
+
+  debugPrintf(
+      "[stage1f-state] CurrentState=%p appSlot=%p app=%p\n",
+      tm_current_state,
+      tm_application_instance_slot,
+      tm_application_instance_slot ? *tm_application_instance_slot : NULL);
+  log_flush_ring();
+
+  tm_native_key_up = (tm_fn_native_key)so_try_find_addr_rx(
+      &g_spiderman,
+      "Java_com_gameloft_android_GAND_GloftSMHP_ML_Spiderman_nativeKeyUp");
+
+  debugPrintf(
+      "[stage1f] resolution helpers -> %dx%d; state=%p keyUp=%p\n",
+      w, h, tm_current_state, tm_native_key_up);
+  log_flush_ring();
+}
+
+/* ---- end Stage 1F controller polish ---- */
+
+/* Stage 1G runtime boost API */
+void dcr_boost_first_picture(void);
+void dcr_boost_launch_end(void);
+
+void port_run(void) {
+  typedef int (*fn_get_env)(void *env);
+  typedef int (*fn_resize)(void *env, void *obj, int width, int height);
+  typedef int (*fn_renderer_init)(void *env, void *obj, int arg, int type);
+  typedef int (*fn_media_init)(void *env, void *obj);
+  typedef int (*fn_update)(void);
+
+  fn_get_env get_env = (fn_get_env)so_try_find_addr_rx(&g_spiderman,
+      "Java_com_gameloft_android_GAND_GloftSMHP_ML_GameRenderer_nativeRendererGetJNIEnv");
+  fn_resize resize = (fn_resize)so_try_find_addr_rx(&g_spiderman,
+      "Java_com_gameloft_android_GAND_GloftSMHP_ML_GameRenderer_nativeResize");
+  fn_renderer_init renderer_init = (fn_renderer_init)so_try_find_addr_rx(&g_spiderman,
+      "Java_com_gameloft_android_GAND_GloftSMHP_ML_GameRenderer_nativeRendererInit");
+  fn_media_init media_init = (fn_media_init)so_try_find_addr_rx(&g_spiderman,
+      "Java_com_gameloft_android_GAND_GloftSMHP_ML_GLMediaPlayer_nativeInit");
+  fn_update update = (fn_update)so_try_find_addr_rx(&g_spiderman,
+      "Java_com_gameloft_android_GAND_GloftSMHP_ML_GameRenderer_nativeUpdateAndRender");
+  tm_fn_touch touch = (tm_fn_touch)so_try_find_addr_rx(&g_spiderman,
+      "Java_com_gameloft_android_GAND_GloftSMHP_ML_GameGLSurfaceView_nativeOnTouch");
+
+  debugPrintf("[stage1b] GetJNIEnv=%p Resize=%p RendererInit=%p MediaInit=%p Update=%p\n",
+              get_env, resize, renderer_init, media_init, update);
+  debugPrintf("[stage1c] NativeTouch=%p\n", touch);
+  log_flush_ring();
+  if (!get_env || !resize || !renderer_init || !update || !touch) return;
+
+  char mapped[DCR_PATH_MAX];
+  const char *android_cfg = "/sdcard/gameloft/games/GloftSMHP/configs.pack";
+  const char *real_cfg = dcr_translate_path(android_cfg, mapped, sizeof mapped);
+  debugPrintf("[stage1b] data %s -> %s\n", android_cfg, real_cfg);
+  FILE *cfg = fopen(real_cfg, "rb");
+  if (!cfg) {
+    debugPrintf("[stage1b] FAIL: configs.pack missing\n");
+    log_flush_ring();
+    return;
+  }
+  fseek(cfg, 0, SEEK_END);
+  long cfg_size = ftell(cfg);
+  fclose(cfg);
+  debugPrintf("[stage1b] configs.pack OK (%ld bytes)\n", cfg_size);
+  log_flush_ring();
+
+  if (tm_gfx_init() != 0) {
+    debugPrintf("[stage1b] FAIL: persistent GLES1 context\n");
+    log_flush_ring();
+    return;
+  }
+
+  tm_enable_gl_debug();
+
+  debugPrintf("[stage1b] constructors...\n");
+  log_flush_ring();
+  so_execute_init_array(&g_spiderman);
+  debugPrintf("[stage1b] constructors PASS\n");
+
+  jni_init();
+  debugPrintf("[stage1b] JNIEnv=%p JavaVM=%p\n", g_jni_env, g_jni_vm);
+
+  debugPrintf("[stage1b] nativeRendererGetJNIEnv...\n");
+  log_flush_ring();
+  int env_rc = get_env(g_jni_env);
+  debugPrintf("[stage1b] nativeRendererGetJNIEnv -> %d\n", env_rc);
+
+  int w = 0, h = 0;
+  dcr_window_size(&w, &h);
+
+  tm_install_game_hooks(w, h);
+
+  debugPrintf("[stage1b] nativeResize(%d,%d)...\n", w, h);
+  log_flush_ring();
+  int resize_rc = resize(g_jni_env, NULL, w, h);
+  debugPrintf("[stage1b] nativeResize -> %d\n", resize_rc);
+  log_flush_ring();
+
+  debugPrintf("[stage1b] nativeRendererInit(0,0)...\n");
+  log_flush_ring();
+  int init_rc = renderer_init(g_jni_env, NULL, 0, 0);
+  debugPrintf("[stage1b] nativeRendererInit -> %d\n", init_rc);
+  log_flush_ring();
+
+  if (media_init) {
+    debugPrintf("[stage1b] GLMediaPlayer.nativeInit...\n");
+    log_flush_ring();
+    int media_rc = media_init(g_jni_env, NULL);
+    debugPrintf("[stage1b] GLMediaPlayer.nativeInit -> %d\n", media_rc);
+    log_flush_ring();
+  }
+
+  debugPrintf("[stage1b] ENTERING REAL TOTAL MAYHEM FRAME LOOP\n");
+  debugPrintf("[stage1f] gameplay controller + menu cursor enabled; MINUS exits debug build\n");
+  log_flush_ring();
+
+  padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+
+  PadState pad;
+  padInitializeDefault(&pad);
+  hidInitializeTouchScreen();
+
+  int screen_touch_down = 0;
+  int screen_touch_x = 0;
+  int screen_touch_y = 0;
+  int stick_down = 0;
+
+  int menu_x = w / 2;
+  int menu_y = h / 2;
+  int menu_mode_prev = -1;
+
+  unsigned long long frame = 0;
+  /* Stage 1D: automatic capture disabled on the GLES1 context. */
+
+  debugPrintf("[stage1e-pad] Switch controller + touchscreen bridge active\n");
+  log_flush_ring();
+
+  tm_touch_ui_init();
+  tm_touch_ui_set_visible(0);
+
+  tm_save_watch_tick(1);
+
+  int tm_pad_reported = 0;
+  unsigned tm_pad_log_budget = 40;
+
+  while (!rt_exit_requested() && appletMainLoop()) {
+    rt_applet_poll();
+    if (!rt_focused()) {
+      svcSleepThread(50000000ll);
+      continue;
+    }
+    padUpdate(&pad);
+
+    if (!tm_pad_reported) {
+      debugPrintf(
+          "[stage1e-pad] connected=%d handheld=%d style=0x%x attrs=0x%x\n",
+          padIsConnected(&pad) ? 1 : 0,
+          padIsHandheld(&pad) ? 1 : 0,
+          (unsigned)padGetStyleSet(&pad),
+          (unsigned)padGetAttributes(&pad));
+      log_flush_ring();
+      tm_pad_reported = 1;
+    }
+
+    const u64 down = padGetButtonsDown(&pad);
+    const u64 up = padGetButtonsUp(&pad);
+
+    if ((down || up) && tm_pad_log_budget) {
+      debugPrintf("[stage1e-pad] down=0x%llx up=0x%llx\n",
+                  (unsigned long long)down,
+                  (unsigned long long)up);
+      log_flush_ring();
+      tm_pad_log_budget--;
+    }
+
+    /* MINUS stays an emergency exit during bring-up. */
+    if (down & HidNpadButton_Minus) {
+      debugPrintf("[stage1c] MINUS pressed -- leaving bring-up build\n");
+      break;
+    }
+
+    /* Switch touchscreen (native 1280x720) -> Android nativeOnTouch. */
+    HidTouchScreenState ts;
+    const size_t ntouch = hidGetTouchScreenStates(&ts, 1);
+    const int touching = ntouch > 0 && ts.count > 0;
+
+    if (touching) {
+      int tx = (int)((long long)ts.touches[0].x * w / 1280);
+      int ty = (int)((long long)ts.touches[0].y * h / 720);
+
+      if (!screen_touch_down) {
+        tm_touch_ui_set_visible(1);
+        touch(g_jni_env, NULL, 1, tx, ty, 0); /* DOWN */
+        debugPrintf("[stage1c] screen touch DOWN %d,%d\n", tx, ty);
+        log_flush_ring();
+      } else if (tx != screen_touch_x || ty != screen_touch_y) {
+        touch(g_jni_env, NULL, 2, tx, ty, 0); /* MOVE */
+      }
+
+      screen_touch_down = 1;
+      screen_touch_x = tx;
+      screen_touch_y = ty;
+    } else if (screen_touch_down) {
+      touch(g_jni_env, NULL, 0, screen_touch_x, screen_touch_y, 0); /* UP */
+      debugPrintf("[stage1c] screen touch UP %d,%d\n",
+                  screen_touch_x, screen_touch_y);
+      log_flush_ring();
+      screen_touch_down = 0;
+      tm_touch_ui_set_visible(0);
+    }
+
+    /*
+     * Generic Android build button map from the working Vita port,
+     * expressed in its original 960x544 virtual UI coordinates.
+     *
+     * B = jump
+     * Y = punch
+     * A = projectile (also gives the title screen a normal touch)
+     * X = super
+     * ZL = danger
+     * PLUS = pause
+     */
+    const int gameplay = tm_is_gameplay_state();
+    const int menu_mode = tm_is_menu_state();
+
+    if (menu_mode != menu_mode_prev) {
+      debugPrintf("[stage1f-menu] mode=%s\n",
+                  gameplay ? "GAMEPLAY" :
+                  (menu_mode ? "MENU" : "TRANSITION"));
+      log_flush_ring();
+      menu_mode_prev = menu_mode;
+    }
+
+    if (gameplay) {
+#define TM_BTN(bit, x960, y544)                                             \
+      do {                                                                  \
+        if (down & (bit))                                                   \
+          tm_virtual_touch(touch, 1, (x960), (y544), 3, w, h);             \
+        if (up & (bit))                                                     \
+          tm_virtual_touch(touch, 0, (x960), (y544), 3, w, h);             \
+      } while (0)
+
+      TM_BTN(HidNpadButton_B,    886, 354); /* jump */
+      TM_BTN(HidNpadButton_Y,    769, 354); /* punch */
+      TM_BTN(HidNpadButton_A,    730, 460); /* web/projectile */
+      TM_BTN(HidNpadButton_X,    824, 460); /* super */
+      TM_BTN(HidNpadButton_ZL,   330, 496); /* context/danger */
+      TM_BTN(HidNpadButton_Plus,  30,  30); /* pause */
+
+#undef TM_BTN
+
+      HidAnalogStickState ls = padGetStickPos(&pad, 0);
+      const int dead = 7000;
+
+      int dpad_x = 0;
+      int dpad_y = 0;
+      const u64 held = padGetButtons(&pad);
+
+      if (held & HidNpadButton_Left)  dpad_x -= 32767;
+      if (held & HidNpadButton_Right) dpad_x += 32767;
+      if (held & HidNpadButton_Up)    dpad_y += 32767;
+      if (held & HidNpadButton_Down)  dpad_y -= 32767;
+
+      if (dpad_x || dpad_y) {
+        ls.x = dpad_x;
+        ls.y = dpad_y;
+      }
+
+      const int moving =
+          ls.x > dead || ls.x < -dead ||
+          ls.y > dead || ls.y < -dead;
+
+      const int base_x = tm_scale_x(132, w);
+      const int base_y = tm_scale_y(436, h);
+
+      if (moving) {
+        int dx960 = (ls.x * 64) / 32767;
+        int dy544 = (-ls.y * 64) / 32767;
+
+        int mx = tm_scale_x(132 + dx960, w);
+        int my = tm_scale_y(436 + dy544, h);
+
+        if (!stick_down) {
+          touch(g_jni_env, NULL, 1, base_x, base_y, 2);
+          stick_down = 1;
+        }
+
+        touch(g_jni_env, NULL, 2, mx, my, 2);
+      } else if (stick_down) {
+        touch(g_jni_env, NULL, 0, base_x, base_y, 2);
+        stick_down = 0;
+      }
+    } else {
+      /* Never leave the gameplay virtual stick held while a menu opens. */
+      if (stick_down) {
+        const int base_x = tm_scale_x(132, w);
+        const int base_y = tm_scale_y(436, h);
+        touch(g_jni_env, NULL, 0, base_x, base_y, 2);
+        stick_down = 0;
+      }
+
+      if (menu_mode) {
+        HidAnalogStickState ls = padGetStickPos(&pad, 0);
+        const u64 held = padGetButtons(&pad);
+        const int dead = 6500;
+
+        int vx = 0;
+        int vy = 0;
+
+        if (ls.x > dead || ls.x < -dead)
+          vx += ls.x / 2600;
+        if (ls.y > dead || ls.y < -dead)
+          vy -= ls.y / 2600;
+
+        if (held & HidNpadButton_Left)  vx -= 10;
+        if (held & HidNpadButton_Right) vx += 10;
+        if (held & HidNpadButton_Up)    vy -= 10;
+        if (held & HidNpadButton_Down)  vy += 10;
+
+        menu_x += vx;
+        menu_y += vy;
+
+        if (menu_x < 12) menu_x = 12;
+        if (menu_x > w - 12) menu_x = w - 12;
+        if (menu_y < 12) menu_y = 12;
+        if (menu_y > h - 12) menu_y = h - 12;
+
+        /* A = tap/select at the software cursor. */
+        if (down & HidNpadButton_A) {
+          debugPrintf("[stage1f-menu] A tap %d,%d\n", menu_x, menu_y);
+          tm_menu_tap(touch, menu_x, menu_y, 3);
+        }
+
+        /* B = Android BACK. */
+        if ((down & HidNpadButton_B) && tm_native_key_up) {
+          debugPrintf("[stage1f-menu] B -> KEYCODE_BACK\n");
+          tm_native_key_up(g_jni_env, NULL, 4);
+        }
+
+        /* R3 recentres the cursor if it gets lost. */
+        if (down & HidNpadButton_StickR) {
+          menu_x = w / 2;
+          menu_y = h / 2;
+        }
+      }
+    }
+
+    update();
+
+    if (menu_mode)
+      tm_draw_menu_cursor(menu_x, menu_y, w, h);
+    if (!b_eglSwapBuffers(g_tm_dpy, g_tm_surface)) {
+      debugPrintf("[stage1b] eglSwapBuffers FAILED at frame %llu: 0x%x\n",
+                  frame, eglGetError());
+      log_flush_ring();
+      break;
+    }
+    /*
+     * Stage 1G: android32 starts the process in FastLoad mode. FastLoad is
+     * CPU 1785 MHz but intentionally pushes the GPU to its minimum clock.
+     * This custom frame loop never told dcr_boost that the first picture had
+     * arrived, so the entire game stayed in "startup" forever (GPU ~76 MHz).
+     *
+     * End that launch boost immediately after the first successful present.
+     * Normal Horizon/sys-clk GPU scaling can then work during gameplay.
+     */
+    if (frame == 0) {
+      dcr_boost_first_picture();
+      dcr_boost_launch_end();
+      debugPrintf(
+          "[stage1g-perf] first frame presented: FastLoad startup boost ended; "
+          "GPU may return to normal gameplay clocks\n");
+      log_flush_ring();
+    }
+
+    frame++;
+
+    if (!(frame % 120))
+      tm_save_watch_tick(0);
+
+    if (frame == 1 || frame == 2 || frame == 10 || frame == 60 || !(frame % 300)) {
+      debugPrintf("[stage1b] GAME FRAME %llu PRESENTED\n", frame);
+      log_flush_ring();
+    }
+  }
+
+  debugPrintf("[stage1b] frame loop ended after %llu frames\n", frame);
+  log_flush_ring();
+  tm_save_watch_tick(1);
+
+  /* Restore the game's original draw routine before shutdown. */
+  tm_touch_ui_set_visible(1);
+
+  tm_audio_shutdown();
+  rt_applet_stop();
+  tm_gfx_shutdown();
+}
+
+/* No frame loop in Stage 0. */
+uint64_t dcr_boot_frames(void) { return dcr_gl_frames(); }
+
+const char *port_apk_help(void) {
+  return "Copy your Ultimate Spider-Man: Total Mayhem HD 1.0.8 APK into /switch/"
+         PORT_NAME "/. The file name does not matter.";
+}
